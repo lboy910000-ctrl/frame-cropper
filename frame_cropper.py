@@ -20,6 +20,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 try:
     import cv2
     import numpy as np
@@ -55,6 +56,115 @@ def list_videos(folder, recursive):
 def make_thumb(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return cv2.resize(gray, THUMB, interpolation=cv2.INTER_AREA).astype(np.int16).ravel()
+
+
+def _short_path(path):
+    """Windows 8.3 path: helps OpenCV open files whose names have special characters."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, 32768)
+        return buf.value if n else None
+    except Exception:
+        return None
+
+
+class CvSource:
+    """OpenCV reader (fast: skips decoding of frames it does not need)."""
+
+    def __init__(self, path, backend):
+        self.cap = None
+        paths = [path]
+        sp = _short_path(path)
+        if sp and sp != path:
+            paths.append(sp)
+        for p in paths:
+            cap = cv2.VideoCapture(p, backend)
+            if cap.isOpened():
+                self.cap = cap
+                break
+            cap.release()
+        if self.cap is None:
+            raise IOError("could not open")
+        ok, first = self.cap.read()
+        if not ok or first is None:
+            self.cap.release()
+            raise IOError("opened but no frame could be decoded")
+        self._first = first
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.fps = fps if fps and fps == fps and 1 <= fps <= 240 else 30.0
+        total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self.total = total if total > 0 else 0
+
+    def first_frame(self):
+        return self._first
+
+    def iter_samples(self, step):
+        yield 0, self._first
+        idx = 1
+        while self.cap.grab():
+            if idx % step == 0:
+                ok, f = self.cap.retrieve()
+                if ok:
+                    yield idx, f
+            idx += 1
+
+    def close(self):
+        self.cap.release()
+
+
+class AvSource:
+    """PyAV reader (bundles its own FFmpeg: handles HEVC/H.265, AV1, etc.)."""
+
+    def __init__(self, path):
+        import av
+        self.c = av.open(path)
+        st = self.c.streams.video[0]
+        st.thread_type = "AUTO"
+        rate = st.average_rate or st.guessed_rate
+        fps = float(rate) if rate else 30.0
+        self.fps = fps if 1 <= fps <= 240 else 30.0
+        dur = (float(self.c.duration) / 1_000_000) if self.c.duration else 0
+        self.total = int(st.frames or 0) or int(dur * self.fps)
+        self._it = self.c.decode(st)
+        self._first = next(self._it).to_ndarray(format="bgr24")
+
+    def first_frame(self):
+        return self._first
+
+    def iter_samples(self, step):
+        yield 0, self._first
+        for idx, fr in enumerate(self._it, start=1):
+            if idx % step == 0:
+                yield idx, fr.to_ndarray(format="bgr24")
+
+    def close(self):
+        try:
+            self.c.close()
+        except Exception:
+            pass
+
+
+def open_source(path):
+    """Try several readers until one can really decode the video."""
+    errs = []
+    backends = [("OpenCV-FFmpeg", cv2.CAP_FFMPEG)]
+    if os.name == "nt":
+        backends.append(("Windows Media Foundation", cv2.CAP_MSMF))
+    for name, b in backends:
+        try:
+            return CvSource(path, b), name
+        except Exception as e:
+            errs.append(f"{name}: {e}")
+    try:
+        return AvSource(path), "PyAV"
+    except ImportError:
+        errs.append("PyAV: not installed")
+    except Exception as e:
+        errs.append(f"PyAV: {e}")
+    raise IOError("; ".join(errs))
 
 
 class History:
@@ -232,29 +342,17 @@ class App(tk.Tk):
             self.out_var.set(d)
 
     def load_preview(self, path):
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            cap.release()
+        try:
+            src, backend = open_source(path)
+        except Exception as e:
             self.canvas.delete("all")
             self.preview_img = None
-            self.write_log(f"Cannot open {os.path.basename(path)}. The file may be incomplete, still being "
-                           "rendered/saved, use an unsupported codec, or have special characters in its path.")
+            self.write_log(f"Cannot read {os.path.basename(path)}: {e}\n"
+                           "(If the file is still being rendered/saved, wait until it finishes.)")
             return
-        total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        ok, frame = False, None
-        for pos in (0.05, 0.0, 0.25):
-            if total and total > 10:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * pos))
-            ok, frame = cap.read()
-            if ok:
-                break
-        cap.release()
-        if not ok:
-            self.canvas.delete("all")
-            self.preview_img = None
-            self.write_log(f"Opened {os.path.basename(path)} but could not decode any frame "
-                           "(unsupported codec or damaged file). Try re-exporting it as H.264 MP4.")
-            return
+        frame = src.first_frame()
+        src.close()
+        self.write_log(f"Preview OK ({backend}).")
         h, w = frame.shape[:2]
         s = min(PREVIEW_MAX[0] / w, PREVIEW_MAX[1] / h)
         dw, dh = int(w * s), int(h * s)
@@ -346,54 +444,53 @@ class App(tk.Tk):
         for vi, path in enumerate(vids, 1):
             if self.stop_flag.is_set():
                 break
-            name = os.path.splitext(os.path.basename(path))[0]
+            base = os.path.basename(path)
+            name = os.path.splitext(base)[0]
             out = os.path.join(o["out"], name) if o["sub"] else o["out"]
             os.makedirs(out, exist_ok=True)
             hist = shared if o["across"] else History()
-            cap = cv2.VideoCapture(path)
-            if not cap.isOpened():
-                q.put(("log", f"Cannot open: {path}"))
+            try:
+                src, backend = open_source(path)
+            except Exception as e:
+                q.put(("log", f"[{vi}/{len(vids)}] SKIPPED {base}: {e}"))
                 continue
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            if not fps or fps != fps or fps < 1 or fps > 240:
-                fps = 30.0
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+            fps, total = src.fps, src.total
             step = max(1, int(round(fps * o["interval"])))
-            q.put(("log", f"[{vi}/{len(vids)}] {os.path.basename(path)}  ({total / fps / 60:.1f} min)"))
-            idx, saved, skipped = 0, 0, 0
-            while not self.stop_flag.is_set():
-                if not cap.grab():
-                    break
-                if idx % step == 0:
-                    ok, frame = cap.retrieve()
-                    if ok:
-                        if o["crop"]:
-                            h, w = frame.shape[:2]
-                            x0, y0, x1, y1 = o["crop"]
-                            frame = frame[int(y0 * h):int(y1 * h), int(x0 * w):int(x1 * w)]
-                        if frame.size:
-                            t = make_thumb(frame)
-                            if hist.is_duplicate(t, o["thr"], o["check_all"]):
-                                skipped += 1
-                            else:
-                                sec = idx / fps
-                                hh, rem = divmod(sec, 3600)
-                                mm, ss = divmod(rem, 60)
-                                fname = f"{name}_{int(hh):02d}-{int(mm):02d}-{int(ss):02d}-{int((ss % 1) * 1000):03d}.{o['fmt']}"
-                                ext = ".jpg" if o["fmt"] == "jpg" else ".png"
-                                params = [cv2.IMWRITE_JPEG_QUALITY, 95] if ext == ".jpg" else []
-                                ok2, buf = cv2.imencode(ext, frame, params)
-                                if ok2:
-                                    with open(os.path.join(out, fname), "wb") as f:
-                                        f.write(buf.tobytes())
-                                    hist.add(t)
-                                    saved += 1
-                                    total_saved += 1
-                        if total:
-                            q.put(("progress", (vi - 1 + idx / total) / len(vids),
-                                   f"Video {vi}/{len(vids)} | saved {total_saved} | skipped dupes {skipped}"))
-                idx += 1
-            cap.release()
+            q.put(("log", f"[{vi}/{len(vids)}] {base}  ({total / fps / 60:.1f} min, reader: {backend})"))
+            saved = skipped = 0
+            try:
+                for idx, frame in src.iter_samples(step):
+                    if self.stop_flag.is_set():
+                        break
+                    if o["crop"]:
+                        h, w = frame.shape[:2]
+                        x0, y0, x1, y1 = o["crop"]
+                        frame = frame[int(y0 * h):int(y1 * h), int(x0 * w):int(x1 * w)]
+                    if frame.size:
+                        t = make_thumb(frame)
+                        if hist.is_duplicate(t, o["thr"], o["check_all"]):
+                            skipped += 1
+                        else:
+                            sec = idx / fps
+                            hh, rem = divmod(sec, 3600)
+                            mm, ss = divmod(rem, 60)
+                            fname = f"{name}_{int(hh):02d}-{int(mm):02d}-{int(ss):02d}-{int((ss % 1) * 1000):03d}.{o['fmt']}"
+                            ext = ".jpg" if o["fmt"] == "jpg" else ".png"
+                            params = [cv2.IMWRITE_JPEG_QUALITY, 95] if ext == ".jpg" else []
+                            ok2, buf = cv2.imencode(ext, frame, params)
+                            if ok2:
+                                with open(os.path.join(out, fname), "wb") as f:
+                                    f.write(buf.tobytes())
+                                hist.add(t)
+                                saved += 1
+                                total_saved += 1
+                    if total:
+                        q.put(("progress", min(1.0, (vi - 1 + idx / total) / len(vids)),
+                               f"Video {vi}/{len(vids)} | saved {total_saved} | skipped dupes {skipped}"))
+            except Exception as e:
+                q.put(("log", f"    stopped early on this video: {e}"))
+            finally:
+                src.close()
             q.put(("log", f"    saved {saved}, skipped {skipped} duplicates"))
         q.put(("done", total_saved, self.stop_flag.is_set()))
 
