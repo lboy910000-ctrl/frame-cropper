@@ -31,7 +31,7 @@ except ImportError:
     )
     raise SystemExit(1)
 
-VIDEO_EXT = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv", ".flv", ".m4v", ".ts", ".mpg", ".mpeg"}
+VIDEO_EXT = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv", ".flv", ".m4v", ".ts", ".mpg", ".mpeg", ".mts", ".m2ts", ".3gp", ".ogv", ".vob", ".f4v"}
 THUMB = (256, 144)        # size used to compare images (width, height)
 PIXEL_DIFF = 14          # a pixel counts as "changed" if gray level differs by more than this
 PREVIEW_MAX = (640, 360)
@@ -128,6 +128,18 @@ class App(tk.Tk):
         folder_row("Video folder", self.in_var, self.pick_in)
         folder_row("Output folder", self.out_var, self.pick_out)
 
+        hdr = ttk.Frame(left); hdr.pack(fill="x")
+        ttk.Label(hdr, text="Videos found (all are processed)").pack(side="left")
+        ttk.Button(hdr, text="Rescan", command=self.rescan).pack(side="right")
+        lf = ttk.Frame(left); lf.pack(fill="x", pady=(0, 8))
+        self.vid_list = tk.Listbox(lf, height=6, width=44, exportselection=False)
+        sb = ttk.Scrollbar(lf, orient="vertical", command=self.vid_list.yview)
+        self.vid_list.config(yscrollcommand=sb.set)
+        self.vid_list.pack(side="left", fill="x", expand=True)
+        sb.pack(side="left", fill="y")
+        self.vid_list.bind("<<ListboxSelect>>", self.on_pick_video)
+        self.videos = []
+
         r = ttk.Frame(left); r.pack(fill="x", pady=2)
         ttk.Label(r, text="Take a picture every (seconds)").pack(side="left")
         ttk.Spinbox(r, from_=0.1, to=600, increment=0.5, width=6, textvariable=self.interval).pack(side="right")
@@ -148,7 +160,8 @@ class App(tk.Tk):
             ("Skip duplicates across different videos", self.across),
             ("Save each video in its own sub-folder", self.subfolders),
         ]:
-            ttk.Checkbutton(left, text=text, variable=var).pack(anchor="w")
+            ttk.Checkbutton(left, text=text, variable=var,
+                            command=self.rescan if var is self.recursive else None).pack(anchor="w")
 
         self.start_btn = ttk.Button(left, text="Start", command=self.start)
         self.start_btn.pack(fill="x", pady=(14, 2))
@@ -188,10 +201,30 @@ class App(tk.Tk):
         self.in_var.set(d)
         if not self.out_var.get():
             self.out_var.set(os.path.join(d, "extracted_images"))
-        vids = list_videos(d, self.recursive.get())
-        self.write_log(f"Found {len(vids)} video(s).")
-        if vids:
-            self.load_preview(vids[0])
+        self.rescan()
+
+    def rescan(self):
+        d = self.in_var.get().strip()
+        self.vid_list.delete(0, "end")
+        self.videos = []
+        if not os.path.isdir(d):
+            self.write_log("Video folder not found. Check the path.")
+            return
+        self.videos = list_videos(d, self.recursive.get())
+        for v in self.videos:
+            self.vid_list.insert("end", os.path.relpath(v, d))
+        self.write_log(f"Found {len(self.videos)} video(s).")
+        if self.videos:
+            self.vid_list.selection_set(0)
+            self.load_preview(self.videos[0])
+        else:
+            self.write_log("No videos found. If they are inside other folders, tick 'Include sub-folders'. "
+                           "Supported: " + ", ".join(sorted(VIDEO_EXT)))
+
+    def on_pick_video(self, _e=None):
+        sel = self.vid_list.curselection()
+        if sel:
+            self.load_preview(self.videos[sel[0]])
 
     def pick_out(self):
         d = filedialog.askdirectory(title="Select output folder")
@@ -200,13 +233,27 @@ class App(tk.Tk):
 
     def load_preview(self, path):
         cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            cap.release()
+            self.canvas.delete("all")
+            self.preview_img = None
+            self.write_log(f"Cannot open {os.path.basename(path)}. The file may be incomplete, still being "
+                           "rendered/saved, use an unsupported codec, or have special characters in its path.")
+            return
         total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        if total and total > 10:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * 0.05))
-        ok, frame = cap.read()
+        ok, frame = False, None
+        for pos in (0.05, 0.0, 0.25):
+            if total and total > 10:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * pos))
+            ok, frame = cap.read()
+            if ok:
+                break
         cap.release()
         if not ok:
-            self.write_log("Could not read a preview frame.")
+            self.canvas.delete("all")
+            self.preview_img = None
+            self.write_log(f"Opened {os.path.basename(path)} but could not decode any frame "
+                           "(unsupported codec or damaged file). Try re-exporting it as H.264 MP4.")
             return
         h, w = frame.shape[:2]
         s = min(PREVIEW_MAX[0] / w, PREVIEW_MAX[1] / h)
