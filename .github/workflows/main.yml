@@ -1,94 +1,65 @@
-"""
-Frame Cropper - offline desktop app
------------------------------------
-Reads every screen-recording video in a folder (any length, e.g. 100 min),
-extracts screenshots at a chosen interval, optionally crops each one to a
-region you draw, and skips duplicate images.
+name: Build app
 
-Install once (needs internet only for this step):
-    pip install opencv-python numpy av
-Run:
-    python frame_cropper.py
-"""
-import base64
-import os
-import queue
-import threading
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
 
-os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
-try:
-    import cv2
-    import numpy as np
-except ImportError:
-    messagebox.showerror(
-        "Missing packages",
-        "Please install the required packages first.\n\n"
-        "Open Command Prompt and run:\n    pip install opencv-python numpy av",
-    )
-    raise SystemExit(1)
+permissions:
+  contents: write
 
-VIDEO_EXT = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv", ".flv", ".m4v", ".ts", ".mpg", ".mpeg", ".mts", ".m2ts", ".3gp", ".ogv", ".vob", ".f4v"}
-THUMB = (256, 144)        # size used to compare images (width, height)
-PIXEL_DIFF = 14          # a pixel counts as "changed" if gray level differs by more than this
-PREVIEW_MAX = (640, 360)
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-def list_videos(folder, recursive):
-    found = []
-    if recursive:
-        for root, _, files in os.walk(folder):
-            for f in files:
-                if os.path.splitext(f)[1].lower() in VIDEO_EXT:
-                    found.append(os.path.join(root, f))
-    else:
-        for f in os.listdir(folder):
-            p = os.path.join(folder, f)
-            if os.path.isfile(p) and os.path.splitext(f)[1].lower() in VIDEO_EXT:
-                found.append(p)
-    return sorted(found)
+      - name: Install Tk (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
 
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
 
-def make_thumb(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return cv2.resize(gray, THUMB, interpolation=cv2.INTER_AREA).astype(np.int16).ravel()
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --onefile --windowed --collect-all av --name FrameCropper frame_cropper.py
+          mkdir release
+          move dist\FrameCropper.exe release\FrameCropper-Windows.exe
 
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --onefile --collect-all av --name FrameCropper frame_cropper.py
+          mkdir release
+          mv dist/FrameCropper release/FrameCropper-Linux
 
-def _short_path(path):
-    """Windows 8.3 path: helps OpenCV open files whose names have special characters."""
-    if os.name != "nt":
-        return None
-    try:
-        import ctypes
-        buf = ctypes.create_unicode_buffer(32768)
-        n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, 32768)
-        return buf.value if n else None
-    except Exception:
-        return None
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --windowed --collect-all av --name FrameCropper frame_cropper.py
+          mkdir release
+          cd dist && zip -r ../release/FrameCropper-macOS.zip FrameCropper.app
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FrameCropper-${{ runner.os }}
+          path: release/*
 
-class CvSource:
-    """OpenCV reader (fast: skips decoding of frames it does not need)."""
-
-    def __init__(self, path, backend):
-        self.cap = None
-        paths = [path]
-        sp = _short_path(path)
-        if sp and sp != path:
-            paths.append(sp)
-        for p in paths:
-            cap = cv2.VideoCapture(p, backend)
-            if cap.isOpened():
-                self.cap = cap
-                break
-            cap.release()
-        if self.cap is None:
-            raise IOError("could not open")
-        ok, first = self.cap.read()
-        if not ok or first is None:
-            self.cap.release()
-            raise IOError("opened but no frame could be decoded")
-        self._first = first
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.fps = fps if fps and fps == fps and 1 <= fps <= 240 else
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
